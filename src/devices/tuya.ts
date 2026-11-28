@@ -1002,6 +1002,25 @@ const spm02Thresholds: Tuya.ValueConverterSingle = {
 };
 
 const tzLocal = {
+    dualRailDatapoints: {
+        convertSet: async (entity, key, value, meta) => {
+            const entries = Object.entries(meta.message);
+            const positionKey = (attr: string) => (attr === "position" && meta.endpoint_name ? `position_${meta.endpoint_name}` : attr);
+            for (const [attr, target] of entries) {
+                if (["position_top", "position_bottom"].includes(positionKey(attr))) {
+                    utils.assertNumber(target, "position");
+                    if (!Number.isFinite(target) || target < 0 || target > 100) throw new Error("Position must be between 0 and 100");
+                }
+            }
+            const top = entries.find(([attr]) => positionKey(attr) === "position_top");
+            const bottom = entries.find(([attr]) => positionKey(attr) === "position_bottom");
+            if (entries.length === 2 && top && bottom) {
+                // Zigbee2MQTT can put the selected endpoint's position last; send top first regardless.
+                return await tuya.tz.datapoints.convertSet(entity, key, value, {...meta, message: Object.fromEntries([top, bottom])});
+            }
+            return tuya.tz.datapoints.convertSet(entity, key, value, meta);
+        },
+    } satisfies Tz.Converter,
     // biome-ignore lint/style/useNamingConvention: ignored using `--suppress`
     TS0301_dual_rail_2: {
         key: ["state", "position"],
@@ -1740,6 +1759,29 @@ const sdm01V2Only = (converter: Tuya.ValueConverterSingle): Tuya.ValueConverterS
 const sdm01Variant = (v1Key: string, v1: Tuya.ValueConverterSingle, v2Key: string, v2: Tuya.ValueConverterSingle): Tuya.ValueConverterSingle => ({
     from: (value, meta, options, publish, msg) =>
         meta.device.meta.sdm01V2 ? {[v2Key]: v2.from(value, meta, options, publish, msg)} : {[v1Key]: v1.from(value, meta, options, publish, msg)},
+});
+
+const dualRailPosition = (rail: "top" | "bottom"): Tuya.ValueConverterSingle => ({
+    from: (_value, meta, options, _publish, msg) => {
+        const dp = rail === "top" ? 3 : 102;
+        // The decoded value loses the datatype and length. Use the last valid raw report for this rail.
+        const entries: Tuya.DpValue[] = msg?.data.dpValues ?? [];
+        const report = entries.findLast(
+            (entry) =>
+                entry.dp === dp &&
+                entry.datatype === tuya.dataTypes.number &&
+                entry.data.length === 4 &&
+                Buffer.from(entry.data).readUInt32BE(0) <= 100,
+        );
+        if (!report) return null;
+
+        const converter = rail === "top" ? tuya.valueConverter.coverPosition : tuya.valueConverter.coverPositionInverted;
+        const state: KeyValue = {};
+        const position = converter.from(tuya.getDataValue(report) as number, meta, options, ({state: value}) => {
+            state[`state_${rail}`] = value;
+        });
+        return {...state, [`position_${rail}`]: position};
+    },
 });
 
 const fzLocal = {
@@ -4443,18 +4485,18 @@ export const definitions: DefinitionWithExtend[] = [
             e.temperature(),
             e.humidity(),
             e.battery(),
-            e.numeric("sensitivity", ea.STATE_SET).withValueMin(0).withValueMax(10).withDescription("Radar sensitivity"),
-            e.numeric("fading_time", ea.STATE_SET).withValueMin(0).withValueMax(1000).withUnit("s").withDescription("Delay before vacant"),
+            e.enum("sensitivity", ea.STATE_SET, ["low", "middle", "high"]).withDescription("Radar sensitivity"),
+            e.numeric("fading_time", ea.STATE_SET).withValueMin(10).withValueMax(180).withUnit("s").withDescription("Delay before vacant"),
         ],
         meta: {
             tuyaDatapoints: [
                 [1, "presence", tuya.valueConverter.trueFalse0],
-                [2, "sensitivity", tuya.valueConverter.raw],
                 [4, "battery", tuya.valueConverter.raw],
                 [7, "temperature", tuya.valueConverter.divideBy10],
                 [8, "humidity", tuya.valueConverter.raw],
+                [9, "sensitivity", tuya.valueConverterBasic.lookup({low: tuya.enum(0), middle: tuya.enum(1), high: tuya.enum(2)})],
                 [11, "illuminance", tuya.valueConverter.raw],
-                [102, "fading_time", tuya.valueConverter.raw],
+                [12, "fading_time", tuya.valueConverter.raw],
             ],
         },
     },
@@ -4887,6 +4929,24 @@ export const definitions: DefinitionWithExtend[] = [
                 [2, "co2", tuya.valueConverter.raw],
                 [18, "temperature", tuya.valueConverter.divideBy10],
                 [19, "humidity", tuya.valueConverter.divideBy10],
+                [21, "voc", tuya.valueConverter.raw],
+                [22, "formaldehyd", tuya.valueConverter.raw],
+            ],
+        },
+    },
+    {
+        fingerprint: tuya.fingerprint("TS0601", ["_TZE204_vw5ufrvc"]),
+        model: "TS0601_air_quality_sensor_3",
+        vendor: "Tuya",
+        description: "5-in-1 air quality sensor (CO2, HCHO, VOC, temperature, humidity)",
+        // Temperature and humidity are reported on their own, CO2/VOC/HCHO only after a dataQuery.
+        extend: [tuya.modernExtend.tuyaBase({dp: true, queryOnConfigure: true, queryOnDeviceAnnounce: true})],
+        exposes: [e.temperature(), e.humidity(), e.co2(), e.voc().withUnit("ppb"), e.formaldehyd().withUnit("µg/m³")],
+        meta: {
+            tuyaDatapoints: [
+                [2, "co2", tuya.valueConverter.raw],
+                [18, "temperature", tuya.valueConverter.divideBy10],
+                [19, "humidity", tuya.valueConverter.raw],
                 [21, "voc", tuya.valueConverter.raw],
                 [22, "formaldehyd", tuya.valueConverter.raw],
             ],
@@ -5693,7 +5753,8 @@ export const definitions: DefinitionWithExtend[] = [
                 e.getDevice().manufacturerName === "_TZB210_u3ri0968" || // https://github.com/Koenkk/zigbee2mqtt/issues/31733
                 e.getDevice().manufacturerName === "_TZB210_rs0ufzwg" || // https://github.com/Koenkk/zigbee2mqtt/issues/31872
                 e.getDevice().manufacturerName === "_TZ3210_mja6r5ix" || // https://github.com/Koenkk/zigbee2mqtt/issues/32428
-                e.getDevice().manufacturerName === "_TZB210_yatkpuha",
+                e.getDevice().manufacturerName === "_TZB210_yatkpuha" ||
+                e.getDevice().manufacturerName === "_TZB210_wy1pyu1q", // https://github.com/Koenkk/zigbee2mqtt/issues/33830
         },
         toZigbee: [tzLocal.TS0505B_1_transitionFixesOnOffBrightness],
         configure: (device, coordinatorEndpoint) => {
@@ -7465,11 +7526,14 @@ export const definitions: DefinitionWithExtend[] = [
         },
     },
     {
-        fingerprint: tuya.fingerprint("TS0301", ["_TZE210_inpjmc0h", "_TZE210_yqwse3h5"]),
+        fingerprint: [...tuya.fingerprint("TS0301", ["_TZE210_inpjmc0h", "_TZE210_yqwse3h5"]), ...tuya.fingerprint("YKV24SAED", ["Yooksmart"])],
         model: "TS0301_dual_rail",
         vendor: "Tuya",
+        whiteLabel: [{vendor: "Yooksmart", model: "YKV24SAED", fingerprint: tuya.fingerprint("YKV24SAED", ["Yooksmart"])}],
         description: "Top-down bottom-up dual motor shade",
-        extend: [tuya.modernExtend.tuyaBase({dp: true}), m.deviceEndpoints({endpoints: {bottom: 1, top: 1}})],
+        extend: [tuya.modernExtend.tuyaBase(), m.deviceEndpoints({endpoints: {bottom: 1, top: 1}})],
+        fromZigbee: [tuya.fz.datapoints],
+        toZigbee: [tzLocal.dualRailDatapoints],
         exposes: [
             te.coverPosition().withEndpoint("bottom").withDescription("Bottom rail"),
             te.coverPosition().withEndpoint("top").withDescription("Top rail"),
@@ -7478,14 +7542,25 @@ export const definitions: DefinitionWithExtend[] = [
         meta: {
             tuyaDatapoints: [
                 // Bottom rail - DP109 is control, DP101 is set position, DP102 is current position
-                [109, "state_bottom", tuya.valueConverterBasic.lookup({OPEN: tuya.enum(0), CLOSE: tuya.enum(1), STOP: tuya.enum(2)})],
-                [101, "position_bottom", tuya.valueConverter.coverPositionInverted],
-                [102, "position_bottom", tuya.valueConverter.coverPositionInverted],
+                // Control and set position DPs are write-only, only the current position DPs publish state
+                [
+                    109,
+                    "state_bottom",
+                    {to: tuya.valueConverterBasic.lookup({OPEN: tuya.enum(0), CLOSE: tuya.enum(1), STOP: tuya.enum(2)}).to},
+                    {optimistic: false},
+                ],
+                [101, "position_bottom", {to: tuya.valueConverter.coverPositionInverted.to}, {optimistic: false}],
+                [102, null, dualRailPosition("bottom")],
                 // Top rail - DP1 is control, DP2 is set position, DP3 is current position
                 // Note: State commands are reversed for Home Assistant compatibility with top-down operation
-                [1, "state_top", tuya.valueConverterBasic.lookup({OPEN: tuya.enum(1), CLOSE: tuya.enum(0), STOP: tuya.enum(2)})],
-                [2, "position_top", tuya.valueConverter.coverPosition],
-                [3, "position_top", tuya.valueConverter.coverPosition],
+                [
+                    1,
+                    "state_top",
+                    {to: tuya.valueConverterBasic.lookup({OPEN: tuya.enum(1), CLOSE: tuya.enum(0), STOP: tuya.enum(2)}).to},
+                    {optimistic: false},
+                ],
+                [2, "position_top", {to: tuya.valueConverter.coverPosition.to}, {optimistic: false}],
+                [3, null, dualRailPosition("top")],
                 // Battery
                 [13, "battery", tuya.valueConverter.raw],
             ],
@@ -8375,8 +8450,10 @@ export const definitions: DefinitionWithExtend[] = [
         meta: {multiEndpoint: true},
         configure: async (device, coordinatorEndpoint) => {
             await tuya.configureMagicPacket(device, coordinatorEndpoint);
-            await reporting.bind(device.getEndpoint(1), coordinatorEndpoint, ["genOnOff"]);
-            if (device.getEndpoint(2)) await reporting.bind(device.getEndpoint(2), coordinatorEndpoint, ["genOnOff"]);
+            // Some units (e.g. _TZE204_wvovwe9h) are DP only and don't support genOnOff, binding fails with INVALID_EP
+            for (const endpoint of [device.getEndpoint(1), device.getEndpoint(2)]) {
+                if (endpoint?.supportsInputCluster("genOnOff")) await reporting.bind(endpoint, coordinatorEndpoint, ["genOnOff"]);
+            }
         },
         endpoint: (device) => {
             // Endpoint selection is made in tuya_switch_state
@@ -11988,11 +12065,11 @@ export const definitions: DefinitionWithExtend[] = [
         ],
         meta: {
             tuyaDatapoints: [
-                [1, "temperature", tuya.valueConverter.divideBy10],
+                [1, "temperature", {from: (v: number) => (v > 32767 ? v - 65536 : v) / 10}],
                 [2, "humidity", tuya.valueConverter.raw],
                 [3, "battery_state", tuya.valueConverter.batteryState],
                 [17, "time_format", tuya.valueConverter.onOff],
-                [38, "external_temperature", tuya.valueConverter.divideBy10],
+                [38, "external_temperature", {from: (v: number) => (v > 32767 ? v - 65536 : v) / 10}],
             ],
         },
     },
@@ -17813,7 +17890,7 @@ export const definitions: DefinitionWithExtend[] = [
         model: "TS110E_1gang_1",
         vendor: "Tuya",
         description: "1 channel dimmer",
-        extend: [tuyaBase(), m.light({powerOnBehavior: false, configureReporting: true, effect: false}), tuya.modernExtend.tuyaMagicPacket()],
+        extend: [tuyaBase(), m.light({powerOnBehavior: false, configureReporting: false, effect: false}), tuya.modernExtend.tuyaMagicPacket()],
         fromZigbee: [tuya.fz.power_on_behavior_1, tuya.fz.TS110E_switch_type, tuya.fz.TS110E, fz.on_off],
         toZigbee: [tuya.tz.TS110E_light_onoff_brightness, tuya.tz.power_on_behavior_1, tuya.tz.TS110E_options],
         exposes: [e.power_on_behavior(), tuya.exposes.switchType(), e.min_brightness(), e.max_brightness()],
@@ -17829,7 +17906,19 @@ export const definitions: DefinitionWithExtend[] = [
             tuya.whitelabel("Lonsonho", "QS-Zigbee-D02-TRIAC-LN_1", "1 channel dimmer", ["_TZ3210_ngqk6jia"]),
         ],
         ota: true,
-        fromZigbee: [tuya.fz.TS110E, tuya.fz.TS110E_light_type, tuya.fz.power_on_behavior_1, fz.on_off],
+        fromZigbee: [
+            tuya.fz.TS110E,
+            {
+                // Attribute 64514 is the switch type on _TZ3210_k1msuvg6 and the light type on the others
+                ...tuya.fz.TS110E_light_type,
+                convert: (model, msg, publish, options, meta) =>
+                    meta.device.manufacturerName === "_TZ3210_k1msuvg6"
+                        ? tuya.fz.TS110E_switch_type.convert(model, msg, publish, options, meta)
+                        : tuya.fz.TS110E_light_type.convert(model, msg, publish, options, meta),
+            } satisfies Fz.Converter<"genLevelCtrl", undefined, ["attributeReport", "readResponse"]>,
+            tuya.fz.power_on_behavior_1,
+            fz.on_off,
+        ],
         toZigbee: [
             tuya.tz.TS110E_onoff_brightness,
             tuya.tz.TS110E_options,
@@ -17842,9 +17931,9 @@ export const definitions: DefinitionWithExtend[] = [
             const countdownValueStep = device.manufacturerName === "_TZ3210_ngqk6jia" ? 30 : 1;
             return [
                 e.light_brightness().withMinBrightness().withMaxBrightness(),
-                tuya.exposes.lightType().withAccess(ea.ALL),
+                // light_type and switch_type share attribute 64514, so expose only the one this device uses
+                device.manufacturerName === "_TZ3210_k1msuvg6" ? tuya.exposes.switchType() : tuya.exposes.lightType().withAccess(ea.ALL),
                 e.power_on_behavior().withAccess(ea.ALL),
-                tuya.exposes.switchType(),
                 tuya.exposes.countdown().withValueStep(countdownValueStep),
             ];
         },
@@ -18571,6 +18660,7 @@ export const definitions: DefinitionWithExtend[] = [
             "_TZ3000_wijoqjk1",
             "_TZ3000_5rpu3r0d",
             "_TZ3000_bbebkwjk",
+            "_TZ3000_djhsq2ff",
         ]),
         model: "TS0001_switch_1_gang",
         vendor: "Tuya",
@@ -18616,7 +18706,7 @@ export const definitions: DefinitionWithExtend[] = [
         whiteLabel: [tuya.whitelabel("iHseno", "_TZ3000_qq9ahj6z", "1-gang touch switch", ["_TZ3000_qq9ahj6z"])],
     },
     {
-        fingerprint: tuya.fingerprint("TS0003", ["_TZ3000_pv4puuxi", "_TZ3000_avky2mvc", "_TZ3000_785olaiq", "_TZ3000_qxcnwv26"]),
+        fingerprint: tuya.fingerprint("TS0003", ["_TZ3000_pv4puuxi", "_TZ3000_avky2mvc", "_TZ3000_785olaiq", "_TZ3000_qxcnwv26", "_TZ3000_3hjasqun"]),
         model: "TS0003_switch_3_gang",
         vendor: "Tuya",
         description: "3-Gang switch with backlight",
@@ -19737,9 +19827,9 @@ export const definitions: DefinitionWithExtend[] = [
                 .numeric("update_frequency", ea.STATE_SET)
                 .withUnit("s")
                 .withDescription("Update frequency")
-                .withValueMin(30)
+                .withValueMin(5)
                 .withValueMax(3600)
-                .withPreset("default", 10, "Default value"),
+                .withPreset("default", 30, "Default value"),
             // e.binary('clear_energy', ea.SET, 'ON', 'OFF').withDescription('Switch to OFF to clear energy'),
             e.binary("device_locating", ea.SET, "ON", "OFF").withDescription("Locate device"),
         ],
@@ -25890,7 +25980,7 @@ export const definitions: DefinitionWithExtend[] = [
         },
     },
     {
-        fingerprint: tuya.fingerprint("TS0601", ["_TZE284_a14rjslz"]),
+        fingerprint: tuya.fingerprint("TS0601", ["_TZE284_a14rjslz", "_TZE284_73llxjvf"]),
         model: "ATMS10013Z3",
         vendor: "Ourtop",
         description: "Zigbee 3 Phase Meter",
